@@ -101,7 +101,9 @@ kotlin {
         val androidInstrumentedTest by getting {
             dependsOn(commonTest)
             dependencies {
-                implementation(project(":multipaz-dcapi:matcherTest"))
+                rootProject.findProject(":multipaz-dcapi:matcherTest")?.let {
+                    implementation(it)
+                }
                 implementation(libs.androidx.espresso.core)
                 implementation(libs.kotlin.test)
                 implementation(libs.kotlinx.coroutines.test)

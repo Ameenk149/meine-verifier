@@ -194,7 +194,9 @@ kotlin {
                 implementation(libs.bouncy.castle.bcpkix)
                 implementation(project(":multipaz-doctypes"))
                 implementation(project(":multipaz-dcapi"))
-                implementation(project(":multipaz-dcapi:matcherTest"))
+                rootProject.findProject(":multipaz-dcapi:matcherTest")?.let {
+                    implementation(it)
+                }
                 implementation(libs.androidx.sqlite)
                 implementation(libs.androidx.sqlite.framework)
                 implementation(libs.androidx.sqlite.bundled)

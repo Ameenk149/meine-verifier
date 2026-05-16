@@ -86,6 +86,62 @@
         </div>
 
     </main>
+
+    <section class="mt-5 pt-4 border-top" id="verification-activity-panel" aria-label="Verification activity debug">
+        <h2 class="h4 mb-3">Verification activity (debug)</h2>
+        <p class="text-body-secondary small mb-3">Structured trace of the last DC exchange: what was requested, what came back from the wallet, and how the server validated it.</p>
+        <div class="accordion" id="verificationActivityAccordion">
+            <div class="accordion-item">
+                <h3 class="accordion-header">
+                    <button class="accordion-button" type="button" data-bs-toggle="collapse" data-bs-target="#va-collapse-1" aria-expanded="true">1. What we asked (presentation / DC requests)</button>
+                </h3>
+                <div id="va-collapse-1" class="accordion-collapse collapse show">
+                    <div class="accordion-body p-0"><pre id="va-asked" class="small font-monospace bg-body-secondary p-3 mb-0" style="max-height: 28rem; overflow: auto;">(no exchange yet)</pre></div>
+                </div>
+            </div>
+            <div class="accordion-item">
+                <h3 class="accordion-header">
+                    <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#va-collapse-2">2. What we received (wallet response)</button>
+                </h3>
+                <div id="va-collapse-2" class="accordion-collapse collapse">
+                    <div class="accordion-body p-0"><pre id="va-received" class="small font-monospace bg-body-secondary p-3 mb-0" style="max-height: 28rem; overflow: auto;">—</pre></div>
+                </div>
+            </div>
+            <div class="accordion-item">
+                <h3 class="accordion-header">
+                    <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#va-collapse-3">3. How we verified (processing steps)</button>
+                </h3>
+                <div id="va-collapse-3" class="accordion-collapse collapse">
+                    <div class="accordion-body p-0"><pre id="va-steps" class="small font-monospace bg-body-secondary p-3 mb-0" style="max-height: 28rem; overflow: auto;">—</pre></div>
+                </div>
+            </div>
+            <div class="accordion-item">
+                <h3 class="accordion-header">
+                    <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#va-collapse-4">4. What we verified (checks that passed)</button>
+                </h3>
+                <div id="va-collapse-4" class="accordion-collapse collapse">
+                    <div class="accordion-body p-0"><pre id="va-checks" class="small font-monospace bg-body-secondary p-3 mb-0" style="max-height: 28rem; overflow: auto;">—</pre></div>
+                </div>
+            </div>
+            <div class="accordion-item">
+                <h3 class="accordion-header">
+                    <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#va-collapse-5">5. Issuer legitimacy (trust)</button>
+                </h3>
+                <div id="va-collapse-5" class="accordion-collapse collapse">
+                    <div class="accordion-body p-0"><pre id="va-issuer" class="small font-monospace bg-body-secondary p-3 mb-0" style="max-height: 28rem; overflow: auto;">—</pre></div>
+                </div>
+            </div>
+            <div class="accordion-item">
+                <h3 class="accordion-header">
+                    <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#va-collapse-6">6. Encryption (asymmetric / symmetric)</button>
+                </h3>
+                <div id="va-collapse-6" class="accordion-collapse collapse">
+                    <div class="accordion-body p-0"><pre id="va-crypto" class="small font-monospace bg-body-secondary p-3 mb-0" style="max-height: 28rem; overflow: auto;">—</pre></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
     <footer class="pt-5 my-5 text-body-secondary border-top">
         This is a testing website that doesn't collect any data.
         It is part of the <a href="https://github.com/openwallet-foundation-labs/identity-credential">OWF Multipaz</a> project

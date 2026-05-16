@@ -17,6 +17,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.addJsonObject
@@ -55,7 +56,7 @@ import org.multipaz.crypto.JsonWebEncryption
 import org.multipaz.crypto.X509Cert
 import org.multipaz.documenttype.DocumentTypeRepository
 import org.multipaz.documenttype.SingleDocumentCannedRequest
-import org.multipaz.documenttype.knowntypes.addKnownTypes
+import org.multipaz.documenttype.knowntypes.DrivingLicense
 import org.multipaz.documenttype.knowntypes.wellKnownMultipleDocumentRequests
 import org.multipaz.mdoc.connectionmethod.MdocConnectionMethodHttp
 import org.multipaz.mdoc.engagement.DeviceEngagement
@@ -95,9 +96,9 @@ import org.multipaz.util.UUID
 import org.multipaz.util.fromBase64Url
 import org.multipaz.util.fromHexByteString
 import org.multipaz.util.toBase64Url
-import org.multipaz.utopia.knowntypes.addUtopiaTypes
 import org.multipaz.verification.VerificationUtil
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.random.Random
 import kotlin.time.Clock
@@ -105,6 +106,229 @@ import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.seconds
 
 private const val TAG = "VerifierServlet"
+
+/** Ephemeral: maps sessionId → JSON describing the DC `dcBegin` request for debug output on `dcGetData`. */
+private val pendingDcPresentationBySessionId = ConcurrentHashMap<String, JsonObject>()
+
+private val cborDiagnosticOptions =
+    setOf(DiagnosticOption.EMBEDDED_CBOR, DiagnosticOption.PRETTY_PRINT)
+
+/** Like [cborDiagnosticOptions] but byte strings print as lengths (HPKE ciphertexts are huge). */
+private val cborEnvelopeDiagnosticOptions =
+    setOf(
+        DiagnosticOption.EMBEDDED_CBOR,
+        DiagnosticOption.PRETTY_PRINT,
+        DiagnosticOption.BSTR_PRINT_LENGTH,
+    )
+
+/**
+ * For W3C DC API `org-iso-mdoc`, the browser-facing JSON carries `deviceRequest` and `encryptionInfo`
+ * as base64url-encoded CBOR (not ciphertext). Decode them so the verification-activity panel can show
+ * the actual structures.
+ */
+private fun enrichMdocApiWalletRequestJson(requestEl: JsonElement): JsonElement {
+    val obj = requestEl as? JsonObject ?: return requestEl
+    val deviceReqB64 = obj["deviceRequest"]?.jsonPrimitive?.content ?: return requestEl
+    return buildJsonObject {
+        for ((k, v) in obj) {
+            put(k, v)
+        }
+        runCatching {
+            Cbor.toDiagnostics(Cbor.decode(deviceReqB64.fromBase64Url()), cborDiagnosticOptions)
+        }.fold(
+            onSuccess = { put("deviceRequestCborDiagnostic", JsonPrimitive(it)) },
+            onFailure = { put("deviceRequestDecodeError", JsonPrimitive(it.message ?: "decode failed")) }
+        )
+        obj["encryptionInfo"]?.jsonPrimitive?.content?.let { encB64 ->
+            runCatching {
+                Cbor.toDiagnostics(Cbor.decode(encB64.fromBase64Url()), cborDiagnosticOptions)
+            }.fold(
+                onSuccess = { put("encryptionInfoCborDiagnostic", JsonPrimitive(it)) },
+                onFailure = { put("encryptionInfoDecodeError", JsonPrimitive(it.message ?: "decode failed")) }
+            )
+        }
+    }
+}
+
+/**
+ * For W3C DC API `org-iso-mdoc`, the wallet JSON includes `response` as base64url-encoded CBOR
+ * (the `dcapi` HPKE envelope). Optionally includes the reader-decrypted `DeviceResponse` CBOR
+ * (same bytes as after HPKE decrypt in [handleDcGetDataMdocApi]) so claims and ZK proof fields
+ * appear with full diagnostic byte strings (`h'…'`).
+ */
+private fun enrichMdocApiWalletResponseJson(
+    responseEl: JsonElement,
+    decryptedDeviceResponseCbor: ByteArray?,
+): JsonElement {
+    val obj = responseEl as? JsonObject ?: return responseEl
+    val responseB64 = obj["response"]?.jsonPrimitive?.content
+    if (responseB64 == null && decryptedDeviceResponseCbor == null) {
+        return responseEl
+    }
+    return buildJsonObject {
+        for ((k, v) in obj) {
+            put(k, v)
+        }
+        responseB64?.let { b64 ->
+            runCatching {
+                Cbor.toDiagnostics(Cbor.decode(b64.fromBase64Url()), cborEnvelopeDiagnosticOptions)
+            }.fold(
+                onSuccess = { put("responseCborDiagnostic", JsonPrimitive(it)) },
+                onFailure = { put("responseDecodeError", JsonPrimitive(it.message ?: "decode failed")) }
+            )
+        }
+        decryptedDeviceResponseCbor?.let { dr ->
+            runCatching {
+                Cbor.toDiagnostics(Cbor.decode(dr), cborDiagnosticOptions)
+            }.fold(
+                onSuccess = { put("hpkeDecryptedDeviceResponseCborDiagnostic", JsonPrimitive(it)) },
+                onFailure = {
+                    put("hpkeDecryptedDeviceResponseDecodeError", JsonPrimitive(it.message ?: "decode failed"))
+                }
+            )
+        }
+    }
+}
+
+private fun rememberDcPresentationForDebug(sessionId: String, clientBeginJson: String, response: DCBeginResponse) {
+    val clientEl = runCatching { Json.parseToJsonElement(clientBeginJson) }.getOrElse { JsonPrimitive(clientBeginJson) }
+    pendingDcPresentationBySessionId[sessionId] = buildJsonObject {
+        put("clientDcBeginBody", clientEl)
+        put(
+            "primaryWalletRequest",
+            buildJsonObject {
+                put("protocol", JsonPrimitive(response.dcRequestProtocol))
+                val requestParsed =
+                    runCatching { Json.parseToJsonElement(response.dcRequestString) }
+                        .getOrElse { JsonPrimitive(response.dcRequestString) }
+                val requestForDebug =
+                    if (response.dcRequestProtocol == "org-iso-mdoc") {
+                        enrichMdocApiWalletRequestJson(requestParsed)
+                    } else {
+                        requestParsed
+                    }
+                put("request", requestForDebug)
+            }
+        )
+        if (response.dcRequestProtocol2 != null || response.dcRequestString2 != null) {
+            put(
+                "secondaryWalletRequest",
+                buildJsonObject {
+                    put("protocol", JsonPrimitive(response.dcRequestProtocol2 ?: ""))
+                    val request2Parsed =
+                        response.dcRequestString2?.let { raw ->
+                            runCatching { Json.parseToJsonElement(raw) }.getOrElse { JsonPrimitive(raw) }
+                        } ?: JsonNull
+                    val request2ForDebug =
+                        if (response.dcRequestProtocol2 == "org-iso-mdoc" && request2Parsed is JsonObject) {
+                            enrichMdocApiWalletRequestJson(request2Parsed)
+                        } else {
+                            request2Parsed
+                        }
+                    put("request", request2ForDebug)
+                }
+            )
+        }
+    }
+}
+
+private fun sessionDebugSnapshot(session: Session): JsonObject =
+    buildJsonObject {
+        put("storedProtocol", JsonPrimitive(session.protocol.name))
+        put("requestFormat", JsonPrimitive(session.requestFormat))
+        put("requestDocType", JsonPrimitive(session.requestDocType))
+        put("requestId", JsonPrimitive(session.requestId))
+        put("signPresentationRequest", JsonPrimitive(session.signRequest))
+        put("encryptResponse", JsonPrimitive(session.encryptResponse))
+        put("responseWasEncrypted", JsonPrimitive(session.responseWasEncrypted))
+        put("nonceBase64Url", JsonPrimitive(session.nonce.toByteArray().toBase64Url()))
+        if (session.rawDcql.isNotEmpty()) {
+            put("rawDcql", JsonPrimitive(session.rawDcql))
+        }
+        if (session.multiDocumentRequestId.isNotEmpty()) {
+            put("multiDocumentRequestId", JsonPrimitive(session.multiDocumentRequestId))
+        }
+    }
+
+private class VerificationTraceCollector {
+    private val steps = mutableListOf<JsonObject>()
+    private val verifiedChecks = mutableListOf<String>()
+    private val encryptionLayers = mutableListOf<JsonObject>()
+    private val issuerEvents = mutableListOf<JsonObject>()
+
+    fun step(title: String, description: String, technical: JsonObject? = null) {
+        steps.add(
+            buildJsonObject {
+                put("step", JsonPrimitive(title))
+                put("description", JsonPrimitive(description))
+                if (technical != null) {
+                    put("technical", technical)
+                }
+            }
+        )
+    }
+
+    fun verified(check: String) {
+        verifiedChecks.add(check)
+    }
+
+    fun encryptionLayer(layer: String, mechanism: String, algorithms: String) {
+        encryptionLayers.add(
+            buildJsonObject {
+                put("layer", JsonPrimitive(layer))
+                put("mechanism", JsonPrimitive(mechanism))
+                put("algorithms", JsonPrimitive(algorithms))
+            }
+        )
+    }
+
+    fun issuer(topic: String, outcome: String, detail: String? = null) {
+        issuerEvents.add(
+            buildJsonObject {
+                put("topic", JsonPrimitive(topic))
+                put("outcome", JsonPrimitive(outcome))
+                if (detail != null) {
+                    put("detail", JsonPrimitive(detail))
+                }
+            }
+        )
+    }
+
+    fun buildActivity(whatWeAsked: JsonObject, whatWeReceived: JsonObject): JsonElement =
+        buildJsonObject {
+            put("whatWeAsked", whatWeAsked)
+            put("whatWeReceived", whatWeReceived)
+            put("howWeVerified", JsonArray(steps.toList()))
+            put("whatWeVerified", JsonArray(verifiedChecks.map { JsonPrimitive(it) }))
+            put(
+                "issuerLegitimacy",
+                buildJsonObject {
+                    put(
+                        "approach",
+                        JsonPrimitive(
+                            "Each credential carries an issuer-signed MSO (or SD-JWT issuer JWT). " +
+                                "The verifier checks the X.509 chain against a built-in TrustManager with pinned " +
+                                "test / IACA roots (OWF Multipaz, Google Wallet IACA, Multipaz test issuer)."
+                        )
+                    )
+                    put("checks", JsonArray(issuerEvents.toList()))
+                }
+            )
+            put(
+                "encryption",
+                buildJsonObject {
+                    put(
+                        "summary",
+                        JsonPrimitive(
+                            "Hybrid model: asymmetric ECDH / HPKE or JWE for key agreement and key wrapping, " +
+                                "then symmetric AEAD (AES-GCM) for the encrypted credential payload."
+                        )
+                    )
+                    put("layers", JsonArray(encryptionLayers.toList()))
+                }
+            )
+        }
+}
 
 suspend fun verifierPost(call: ApplicationCall, command: String) {
     val requestData = call.receive<ByteArray>()
@@ -193,7 +417,8 @@ private data class OpenID4VPGetData(
 
 @Serializable
 private data class OpenID4VPResultData(
-    val pages: List<ResultPage>
+    val pages: List<ResultPage>,
+    val verificationActivity: JsonElement? = null,
 )
 
 @Serializable
@@ -322,10 +547,9 @@ private val verifierSessionTableSpec = StorageTableSpec(
 )
 
 val documentTypeRepo: DocumentTypeRepository by lazy {
-    val repo =  DocumentTypeRepository()
-    repo.addKnownTypes()
-    repo.addUtopiaTypes()
-    repo
+    DocumentTypeRepository().apply {
+        addDocumentType(DrivingLicense.getDocumentType())
+    }
 }
 
 
@@ -373,6 +597,9 @@ private suspend fun handleGetAvailableRequests(
                     // Not supported
                     continue
                 }
+                if (sr.mdocRequest == null) {
+                    continue
+                }
                 sampleRequests.add(SampleRequest(
                     sr.id,
                     sr.displayName,
@@ -394,15 +621,8 @@ private suspend fun handleGetAvailableRequests(
             ))
         }
     }
-    val multiDocumentRequests = wellKnownMultipleDocumentRequests.map { mdr ->
-        MultiDocumentRequest(
-            id = mdr.id,
-            displayName = mdr.displayName
-        )
-    }
-
     val json = Json { ignoreUnknownKeys = true }
-    val responseString = json.encodeToString(AvailableRequests(requests, multiDocumentRequests))
+    val responseString = json.encodeToString(AvailableRequests(requests, emptyList()))
     call.respondText(
         status = HttpStatusCode.OK,
         contentType = ContentType.Application.Json,
@@ -553,6 +773,7 @@ private suspend fun handleDcBegin(
             )
         }
         Logger.i(TAG, "beginResponse: $beginResponse")
+        rememberDcPresentationForDebug(sessionId, requestString, beginResponse)
         val json = Json { ignoreUnknownKeys = true }
         call.respondText(
             contentType = ContentType.Application.Json,
@@ -631,21 +852,21 @@ private suspend fun handleDcBeginRawDcql(
         responseUri = null
     )
     Logger.i(TAG, "dcRequestString: $dcRequestString")
-    val json = Json { ignoreUnknownKeys = true }
-    val responseString = json.encodeToString(
-        DCBeginResponse(
-            sessionId = sessionId,
-            dcRequestProtocol = when (version) {
-                OpenID4VP.Version.DRAFT_24 -> "openidvp"
-                OpenID4VP.Version.DRAFT_29 -> {
-                    if (request.signRequest) "openid4vp-v1-signed" else "openid4vp-v1-unsigned"
-                }
-            },
-            dcRequestString = dcRequestString,
-            dcRequestProtocol2 = null,
-            dcRequestString2 = null
-        )
+    val beginResponse = DCBeginResponse(
+        sessionId = sessionId,
+        dcRequestProtocol = when (version) {
+            OpenID4VP.Version.DRAFT_24 -> "openidvp"
+            OpenID4VP.Version.DRAFT_29 -> {
+                if (request.signRequest) "openid4vp-v1-signed" else "openid4vp-v1-unsigned"
+            }
+        },
+        dcRequestString = dcRequestString,
+        dcRequestProtocol2 = null,
+        dcRequestString2 = null
     )
+    rememberDcPresentationForDebug(sessionId, requestString, beginResponse)
+    val json = Json { ignoreUnknownKeys = true }
+    val responseString = json.encodeToString(beginResponse)
     call.respondText(
         contentType = ContentType.Application.Json,
         text = responseString
@@ -703,18 +924,20 @@ private suspend fun handleDcGetData(
         ?: throw InvalidRequestException("No session for sessionId ${request.sessionId}")
     val session = Session.fromCbor(encodedSession.toByteArray())
 
-    //Logger.i(TAG, "Data received from WC3 DC API: protocol=${request.credentialProtocol} data=${request.credentialResponse}")
-
+    val trace = VerificationTraceCollector()
+    val deviceResponseCountBefore = session.deviceResponses.size
     when (request.credentialProtocol) {
-        "openid4vp" -> handleDcGetDataOpenID4VP(24, session, request.credentialResponse)
-        "openid4vp-v1-signed", "openid4vp-v1-unsigned" -> handleDcGetDataOpenID4VP(29, session, request.credentialResponse)
-        "org-iso-mdoc" -> handleDcGetDataMdocApi(session, request.credentialResponse)
+        "openid4vp" -> handleDcGetDataOpenID4VP(24, session, request.credentialResponse, trace)
+        "openid4vp-v1-signed", "openid4vp-v1-unsigned" ->
+            handleDcGetDataOpenID4VP(29, session, request.credentialResponse, trace)
+        "org-iso-mdoc" -> handleDcGetDataMdocApi(session, request.credentialResponse, trace)
         else -> throw IllegalArgumentException("unsupported protocol ${request.credentialProtocol}")
     }
+    val newlyAddedDeviceResponses = session.deviceResponses.drop(deviceResponseCountBefore)
 
     val pages = mutableListOf<ResultPage>()
     if (session.deviceResponses.size > 0) {
-        pages.addAll(handleGetDataMdoc(session, request.credentialProtocol))
+        pages.addAll(handleGetDataMdoc(session, request.credentialProtocol, trace))
     }
 
     if (session.verifiablePresentations.size > 0) {
@@ -723,20 +946,62 @@ private suspend fun handleDcGetData(
         } else {
             "web-origin:${session.origin}"
         }
-        pages.addAll(handleGetDataSdJwt(session, request.credentialProtocol, clientIdToUse))
+        pages.addAll(handleGetDataSdJwt(session, request.credentialProtocol, clientIdToUse, trace))
     }
+
+    val whatWeAsked = pendingDcPresentationBySessionId.remove(request.sessionId)
+        ?: buildJsonObject {
+            put(
+                "note",
+                JsonPrimitive(
+                    "No matching dcBegin payload was found (older session or non-DC begin flow). " +
+                        "Showing stored session fields only."
+                )
+            )
+            put("session", sessionDebugSnapshot(session))
+        }
+
+    val whatWeReceived = runCatching { Json.parseToJsonElement(request.credentialResponse) }.getOrElse {
+        buildJsonObject {
+            put("parseError", JsonPrimitive(it.message ?: "invalid JSON"))
+            put("rawTruncated", JsonPrimitive(request.credentialResponse.take(16_000)))
+        }
+    }
+    val mdocDcApiDecryptedDeviceResponse =
+        if (request.credentialProtocol == "org-iso-mdoc") {
+            newlyAddedDeviceResponses.lastOrNull()
+        } else {
+            null
+        }
+    val whatWeReceivedForDebug =
+        if (request.credentialProtocol == "org-iso-mdoc" && whatWeReceived is JsonObject) {
+            enrichMdocApiWalletResponseJson(whatWeReceived, mdocDcApiDecryptedDeviceResponse)
+        } else {
+            whatWeReceived
+        }
+    val walletEnvelope = buildJsonObject {
+        put("credentialProtocol", JsonPrimitive(request.credentialProtocol))
+        put("payload", whatWeReceivedForDebug)
+    }
+
+    val verificationActivity = trace.buildActivity(whatWeAsked, walletEnvelope)
 
     val json = Json { ignoreUnknownKeys = true }
     call.respondText(
         contentType = ContentType.Application.Json,
-        text = json.encodeToString(OpenID4VPResultData(pages))
+        text = json.encodeToString(OpenID4VPResultData(pages, verificationActivity))
     )
 }
 
 private suspend fun handleDcGetDataMdocApi(
     session: Session,
-    credentialResponse: String
+    credentialResponse: String,
+    trace: VerificationTraceCollector,
 ) {
+    trace.step(
+        title = "Parse W3C Digital Credentials API response",
+        description = "Expect JSON with base64url-encoded CBOR array labelled dcapi (per ISO 18013-7 / DC API).",
+    )
     val response = Json.parseToJsonElement(credentialResponse).jsonObject
     val encryptedResponseBase64 = response["response"]!!.jsonPrimitive.content
 
@@ -747,6 +1012,12 @@ private suspend fun handleDcGetDataMdocApi(
     val encryptionParameters = array.get(1).asMap
     val enc = encryptionParameters[Tstr("enc")]!!.asBstr
     val cipherText = encryptionParameters[Tstr("cipherText")]!!.asBstr
+
+    trace.encryptionLayer(
+        layer = "Wallet → reader (DC API response)",
+        mechanism = "HPKE: wallet encrypts DeviceResponse to reader public key using session transcript as info.",
+        algorithms = "DHKEM_P256_HKDF_SHA256_HKDF_SHA256_AES_128_GCM (HPKE) + AES-128-GCM for ciphertext",
+    )
 
     val encryptionInfo = buildCborArray {
         add("dcapi")
@@ -783,11 +1054,16 @@ private suspend fun handleDcGetDataMdocApi(
         encapsulatedKey = enc,
         info = session.sessionTranscript!!
     )
+    trace.step(
+        title = "HPKE decrypt DeviceResponse",
+        description = "Reader P-256 private key + encapsulated public key from wallet; derive symmetric key and decrypt AES-GCM ciphertext.",
+    )
     val deviceResponse = decrypter.decrypt(
         ciphertext = cipherText,
         aad = ByteArray(0)
     )
     session.deviceResponses.add(deviceResponse)
+    trace.verified("Encrypted DC API payload decrypted (HPKE)")
 
     //Logger.iCbor(TAG, "decrypted DeviceResponse", session.deviceResponse!!)
     Logger.iCbor(TAG, "SessionTranscript", session.sessionTranscript!!)
@@ -796,13 +1072,23 @@ private suspend fun handleDcGetDataMdocApi(
 private suspend fun handleDcGetDataOpenID4VP(
     version: Int,
     session: Session,
-    credentialResponse: String
+    credentialResponse: String,
+    trace: VerificationTraceCollector,
 ) {
     val response = Json.parseToJsonElement(credentialResponse).jsonObject
 
     val encryptedResponse = response["response"]
     val vpToken = if (encryptedResponse != null) {
         session.responseWasEncrypted = true
+        trace.step(
+            title = "Decrypt OpenID4VP-secured DC response",
+            description = "JWE `response` field present: decrypt using reader EC P-256 key (ECDH-based key agreement inside JWE).",
+        )
+        trace.encryptionLayer(
+            layer = "Wallet → reader (OpenID4VP over DC API)",
+            mechanism = "JSON Web Encryption (RFC 7516) on the OpenID4VP response object",
+            algorithms = "ECDH-ES + AES content encryption (per JWE header on the wire)",
+        )
         val decryptedResponse = JsonWebEncryption.decrypt(
             encryptedResponse.jsonPrimitive.content,
             AsymmetricKey.anonymous(
@@ -810,8 +1096,13 @@ private suspend fun handleDcGetDataOpenID4VP(
                 algorithm = session.encryptionKey.curve.defaultKeyAgreementAlgorithm
             )
         ).jsonObject
+        trace.verified("OpenID4VP JWE response decrypted")
         decryptedResponse["vp_token"]!!.jsonObject
     } else {
+        trace.step(
+            title = "OpenID4VP response envelope",
+            description = "No JWE `response` wrapper — vp_token taken as plaintext JSON.",
+        )
         response["vp_token"]!!.jsonObject
     }
     //Logger.iJson(TAG, "vpToken", vpToken)
@@ -823,7 +1114,7 @@ private suspend fun handleDcGetDataOpenID4VP(
             else -> throw IllegalArgumentException("Unsupported OpenID4VP version $version")
         }
         for (credentialResponse in credentialResponses) {
-            handleDcGetDataOpenID4VPForCredentialResponse(version, session, credentialResponse)
+            handleDcGetDataOpenID4VPForCredentialResponse(version, session, credentialResponse, trace)
         }
     }
 }
@@ -831,7 +1122,8 @@ private suspend fun handleDcGetDataOpenID4VP(
 private suspend fun handleDcGetDataOpenID4VPForCredentialResponse(
     version: Int,
     session: Session,
-    credentialResponse: String
+    credentialResponse: String,
+    trace: VerificationTraceCollector,
 ) {
     // This is a total hack but in case of Raw DCQL we actually don't really
     // know what was requested. This heuristic to determine if the token is
@@ -845,6 +1137,14 @@ private suspend fun handleDcGetDataOpenID4VPForCredentialResponse(
         false
     }
     Logger.i(TAG, "isMdoc: $isMdoc")
+    trace.step(
+        title = "Classify vp_token credential",
+        description = if (isMdoc) {
+            "CBOR decode succeeded → treat as ISO mdoc (DeviceResponse bytes)."
+        } else {
+            "Not CBOR mdoc → treat as SD-JWT / JWT-based verifiable presentation string."
+        },
+    )
 
     if (isMdoc) {
         val effectiveClientId = if (session.signRequest) {
@@ -891,9 +1191,18 @@ private suspend fun handleDcGetDataOpenID4VPForCredentialResponse(
         )
         Logger.iCbor(TAG, "handoverInfo", handoverInfo)
         Logger.iCbor(TAG, "sessionTranscript", session.sessionTranscript!!)
+        trace.step(
+            title = "Build SessionTranscript (OpenID4VP DC API handover)",
+            description = "SHA-256 digest of OpenID4VP handover CBOR is embedded in SessionTranscript for DeviceAuthentication.",
+        )
         session.deviceResponses.add(credentialResponse.fromBase64Url())
+        trace.verified("mDoc credential bytes extracted from vp_token")
     } else {
         session.verifiablePresentations.add(credentialResponse)
+        trace.step(
+            title = "Store SD-JWT / JWT presentation",
+            description = "Non-mdoc token stored for SD-JWT verification path.",
+        )
     }
 }
 
@@ -1465,6 +1774,7 @@ suspend fun getIssuerTrustManager(): TrustManagerInterface {
 private suspend fun handleGetDataMdoc(
     session: Session,
     dcProtocol: String?,
+    trace: VerificationTraceCollector? = null,
 ): List<ResultPage> {
     val pages = mutableListOf<ResultPage>()
 
@@ -1483,6 +1793,11 @@ private suspend fun handleGetDataMdoc(
         }
         lines.add(ResultLine("Response end-to-end encrypted", "${session.responseWasEncrypted}"))
 
+        trace?.step(
+            title = "Decode ISO mdoc DeviceResponse",
+            description = "Parse CBOR DeviceResponse; contains MSO-signed issuer namespaces and device-signed payloads.",
+        )
+
         val deviceResponse = DeviceResponse.fromDataItem(
             Cbor.decode(encodedDeviceResponse)
         )
@@ -1496,6 +1811,11 @@ private suspend fun handleGetDataMdoc(
                     "Verified"
                 )
             )
+            trace?.step(
+                title = "DeviceResponse.verify",
+                description = "Cryptographic checks that DeviceResponse matches SessionTranscript (per ISO 18013-5 / session binding).",
+            )
+            trace?.verified("DeviceResponse authenticity / session binding (MAC & session transcript)")
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             lines.add(
@@ -1503,6 +1823,10 @@ private suspend fun handleGetDataMdoc(
                     "Device Response",
                     "Error verifying: $e"
                 )
+            )
+            trace?.step(
+                title = "DeviceResponse.verify failed",
+                description = e.message ?: e.toString(),
             )
         }
 
@@ -1513,12 +1837,26 @@ private suspend fun handleGetDataMdoc(
                     val tp = trustResult.trustPoints[0]
                     val name = tp.metadata.displayName ?: tp.certificate.subject.name
                     lines.add(ResultLine("Issuer", "In trust list ($name)"))
+                    trace?.issuer(
+                        topic = "Issuer chain (MSO) docType=${document.docType}",
+                        outcome = "Trusted anchor: $name",
+                    )
+                    trace?.verified("Issuer X.509 chain for MSO → trust list match (${document.docType})")
                 } else {
                     if (document.issuerCertChain.certificates.size > 0) {
                         val name = document.issuerCertChain.certificates.first().subject.name
                         lines.add(ResultLine("Issuer", "Not in trust list ($name)"))
+                        trace?.issuer(
+                            topic = "Issuer chain (MSO) docType=${document.docType}",
+                            outcome = "Not in trust list",
+                            detail = name,
+                        )
                     } else {
                         lines.add(ResultLine("Issuer", "Not signed by issuer"))
+                        trace?.issuer(
+                            topic = "Issuer chain (MSO) docType=${document.docType}",
+                            outcome = "No issuer certificates on MSO",
+                        )
                     }
                 }
             } catch (e: Exception) {
@@ -1528,6 +1866,10 @@ private suspend fun handleGetDataMdoc(
                         "Document",
                         "Verification failed: $e"
                     )
+                )
+                trace?.step(
+                    title = "Issuer / document verification error",
+                    description = e.message ?: e.toString(),
                 )
             }
 
@@ -1562,6 +1904,10 @@ private suspend fun handleGetDataMdoc(
                             "ZK System Spec ID ${zkDocument.documentData.zkSystemSpecId} was not found."
                         )
                     )
+                    trace?.step(
+                        title = "ZK proof lookup",
+                        description = "ZK System Spec ID ${zkDocument.documentData.zkSystemSpecId} was not found.",
+                    )
                 } else {
 
                     zkSystemRepository.lookup(zkSystemSpec.system)
@@ -1577,10 +1923,16 @@ private suspend fun handleGetDataMdoc(
                             "Successfully validated proof \uD83E\uDE84"
                         )
                     )
+                    trace?.step(
+                        title = "Zero-knowledge proof verification",
+                        description = "Verified ZK proof using system '${zkSystemSpec.system}' and circuit id '${zkSystemSpec.id}'.",
+                    )
+                    trace?.verified("ZKP (${zkSystemSpec.system})")
                 }
 
                 if (zkDocument.documentData.msoX5chain == null) {
                     lines.add(ResultLine("Issuer", "No msoX5chain in ZkDocumentData"))
+                    trace?.issuer("Issuer chain (ZKP MSO)", "No msoX5chain present")
                 } else {
                     val trustResult =
                         trustManager.verify(zkDocument.documentData.msoX5chain!!.certificates)
@@ -1588,10 +1940,13 @@ private suspend fun handleGetDataMdoc(
                         val tp = trustResult.trustPoints[0]
                         val name = tp.metadata.displayName ?: tp.certificate.subject.name
                         lines.add(ResultLine("Issuer", "In trust list ($name)"))
+                        trace?.issuer("Issuer chain (ZKP MSO)", "Trusted anchor: $name")
+                        trace?.verified("Issuer X.509 chain for ZK MSO → trust list match")
                     } else {
                         val name =
                             zkDocument.documentData.msoX5chain!!.certificates.first().subject.name
                         lines.add(ResultLine("Issuer", "Not in trust list ($name)"))
+                        trace?.issuer("Issuer chain (ZKP MSO)", "Not in trust list", name)
                     }
                 }
 
@@ -1635,6 +1990,7 @@ private suspend fun handleGetDataSdJwt(
     session: Session,
     dcProtocol: String?,
     clientIdToUse: String,
+    trace: VerificationTraceCollector? = null,
 ): List<ResultPage> {
     val pages = mutableListOf<ResultPage>()
     val trustManager = getIssuerTrustManager()
@@ -1647,6 +2003,10 @@ private suspend fun handleGetDataSdJwt(
         }
 
         Logger.d(TAG, "Handling SD-JWT: $presentationString")
+        trace?.step(
+            title = "Parse SD-JWT presentation",
+            description = "Compact serialization: SD-JWT or SD-JWT+KB (key binding).",
+        )
         val (sdJwt, sdJwtKb) = if (presentationString.endsWith("~")) {
             Pair(SdJwt.fromCompactSerialization(presentationString), null)
         } else {
@@ -1656,15 +2016,19 @@ private suspend fun handleGetDataSdJwt(
         val issuerCert = sdJwt.x5c?.certificates?.first()
         if (issuerCert == null) {
             lines.add(ResultLine("Error", "Issuer-signed key not in `x5c` in header"))
+            trace?.step("SD-JWT issuer key", "No x5c certificate chain in JWT header")
         } else {
             val trustResult = trustManager.verify(sdJwt.x5c!!.certificates)
             if (trustResult.isTrusted) {
                 val tp = trustResult.trustPoints[0]
                 val name = tp.metadata.displayName ?: tp.certificate.subject.name
                 lines.add(ResultLine("Issuer", "In trust list ($name)"))
+                trace?.issuer("SD-JWT issuer x5c", "Trusted anchor: $name")
+                trace?.verified("SD-JWT issuer X.509 chain → trust list match")
             } else {
                 val name = issuerCert.subject.name
                 lines.add(ResultLine("Issuer", "Not in trust list ($name)"))
+                trace?.issuer("SD-JWT issuer x5c", "Not in trust list", name)
             }
         }
         if (sdJwtKb == null && sdJwt.jwtBody["cnf"] != null) {
@@ -1689,6 +2053,11 @@ private suspend fun handleGetDataSdJwt(
                 )
                 lines.add(ResultLine("Key Binding", "Verified"))
                 lines.add(ResultLine("Audience", receivedAudience))
+                trace?.verified("SD-JWT+KB key binding (holder binding JWT)")
+                trace?.step(
+                    title = "SD-JWT+KB.verify",
+                    description = "Validates KB-JWT using issuer key; checks audience/nonce hooks (simplified in this build).",
+                )
 
                 for ((claimName, claimValue) in processedJwt) {
                     val claimValueStr = prettyJson.encodeToString(claimValue)
@@ -1701,6 +2070,7 @@ private suspend fun handleGetDataSdJwt(
         } else if (issuerCert != null) {
             try {
                 val processedJwt = sdJwt.verify(issuerCert.ecPublicKey)
+                trace?.verified("SD-JWT issuer signature (JWT signed by issuer EC key)")
                 for ((claimName, claimValue) in processedJwt) {
                     val claimValueStr = prettyJson.encodeToString(claimValue)
                     lines.add(ResultLine(claimName, claimValueStr))

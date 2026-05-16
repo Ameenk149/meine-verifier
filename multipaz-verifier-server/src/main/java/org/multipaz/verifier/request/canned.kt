@@ -11,7 +11,6 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import org.multipaz.documenttype.SingleDocumentCannedRequest
-import org.multipaz.documenttype.knowntypes.wellKnownMultipleDocumentRequests
 
 suspend fun cannedRequests(call: ApplicationCall) {
     call.respondText(
@@ -37,20 +36,6 @@ suspend fun cannedRequests(call: ApplicationCall) {
                         putJsonArray("requests") {
                             for (singleDocumentRequest in mdocRequests) {
                                 addSingleDocumentRequest(singleDocumentRequest, true)
-                            }
-                        }
-                    }
-                }
-            }
-            addJsonObject {
-                put("display_name", "Multi-document requests")
-                putJsonArray("requests") {
-                    for (mdr in wellKnownMultipleDocumentRequests) {
-                        addJsonObject {
-                            put("display_name", mdr.displayName)
-                            put("dcql", Json.parseToJsonElement(mdr.dcqlString))
-                            mdr.transactionData?.let {
-                                put("transaction_data", Json.parseToJsonElement(it))
                             }
                         }
                     }

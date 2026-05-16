@@ -1,5 +1,24 @@
+import java.io.File
+import java.io.FileInputStream
+import java.util.Properties
+
 rootProject.name = "MultipazProject"
 enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
+
+/** True when ANDROID_HOME or local.properties `sdk.dir` points at an existing SDK. */
+fun hasAndroidSdk(rootDir: File): Boolean {
+    System.getenv("ANDROID_HOME")
+        ?.takeIf { it.isNotBlank() }
+        ?.let { File(it) }
+        ?.takeIf { it.isDirectory }
+        ?.let { return true }
+    val localProps = File(rootDir, "local.properties")
+    if (!localProps.isFile) return false
+    val props = Properties()
+    FileInputStream(localProps).use { props.load(it) }
+    val sdkDir = props.getProperty("sdk.dir")?.trim()?.removeSurrounding("\"", "\"") ?: return false
+    return File(sdkDir).isDirectory
+}
 
 // As per https://www.jetbrains.com/help/kotlin-multiplatform-dev/compose-test.html#-o0tm8i_54
 // "Currently, you cannot run common Compose Multiplatform tests using android (local) test
@@ -75,7 +94,9 @@ include(":multipaz-csa")
 include(":multipaz-android-legacy")
 include(":multipaz-longfellow")
 include(":multipazctl")
-include(":multipaz-dcapi:matcherTest")
+if (hasAndroidSdk(rootDir)) {
+    include(":multipaz-dcapi:matcherTest")
+}
 include(":multipaz-server")
 include(":multipaz-backend-server")
 include(":multipaz-compose")
