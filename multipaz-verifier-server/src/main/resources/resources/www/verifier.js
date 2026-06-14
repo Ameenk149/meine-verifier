@@ -382,19 +382,75 @@ function renderVerificationActivity(activity) {
 function showResponse(credentialResponse) {
     renderVerificationActivity(credentialResponse.verificationActivity)
     var modalTitle = document.getElementById('dcResultModalLabel')
+    modalTitle.innerHTML = 'Returned Credentials (' + credentialResponse.pages.length + ')'
+    var benchmarkDiv = document.getElementById('dcResultBenchmarks')
     var modalBody = document.getElementById('dcResultModal').querySelector('.list-group')
     modalBody.innerHTML = ''
+    var benchmarks = collectZkpBenchmarks(credentialResponse)
+    if (benchmarks.length > 0) {
+        benchmarkDiv.hidden = false
+        benchmarkDiv.innerHTML =
+            '<div class="alert alert-warning mb-0">' +
+            '<div class="fw-bold mb-2">ZKP benchmark</div>' +
+            benchmarks.map(function (line) {
+                return '<div class="font-monospace">' +
+                    escapeHtml(line.value) +
+                    '</div>'
+            }).join('') +
+            '</div>'
+    } else {
+        benchmarkDiv.hidden = true
+        benchmarkDiv.innerHTML = ''
+    }
     var pageNum = 0
     for (const page of credentialResponse.pages) {
         if (pageNum++ != 0) {
           modalBody.innerHTML += '<li class="list-group-item d-flex justify-content-between align-items-start"><div class="ms-2 me-auto"><div class="fw-bold">===========</div></div></li>'
         }
         for (const line of page.lines) {
-            modalBody.innerHTML += '<li class="list-group-item d-flex justify-content-between align-items-start"><div class="ms-2 me-auto"><div class="fw-bold">' + line.key + '</div>' + line.value + '</div></li>'
+            modalBody.innerHTML += formatResultLineListItem(line)
         }
     }
     var modal = new bootstrap.Modal(document.getElementById('dcResultModal'), {})
     modal.show()
+}
+
+function collectZkpBenchmarks(credentialResponse) {
+    if (credentialResponse.benchmarks && credentialResponse.benchmarks.length > 0) {
+        return credentialResponse.benchmarks
+    }
+    var benchmarks = []
+    for (const page of credentialResponse.pages || []) {
+        for (const line of page.lines || []) {
+            if (isZkpBenchmarkLine(line.key)) {
+                benchmarks.push(line)
+            }
+        }
+    }
+    return benchmarks
+}
+
+function isZkpBenchmarkLine(key) {
+    return key === 'ZKP proof validation time'
+}
+
+function formatResultLineListItem(line) {
+    const benchmark = isZkpBenchmarkLine(line.key)
+    const itemClass = benchmark
+        ? 'list-group-item list-group-item-warning d-flex justify-content-between align-items-start'
+        : 'list-group-item d-flex justify-content-between align-items-start'
+    const valueClass = benchmark ? 'font-monospace' : ''
+    return '<li class="' + itemClass + '"><div class="ms-2 me-auto">' +
+        '<div class="fw-bold">' + escapeHtml(line.key) + '</div>' +
+        '<div class="' + valueClass + '">' + escapeHtml(line.value) + '</div></div></li>'
+}
+
+function escapeHtml(text) {
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
 }
 
 function openid4vpAuthenticateWithWallet() {

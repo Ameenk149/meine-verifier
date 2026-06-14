@@ -104,6 +104,7 @@ import kotlin.random.Random
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 
 private const val TAG = "VerifierServlet"
 
@@ -419,6 +420,7 @@ private data class OpenID4VPGetData(
 private data class OpenID4VPResultData(
     val pages: List<ResultPage>,
     val verificationActivity: JsonElement? = null,
+    val benchmarks: List<ResultLine> = emptyList(),
 )
 
 @Serializable
@@ -906,7 +908,7 @@ private suspend fun handleAnnexAGetData(
         val json = Json { ignoreUnknownKeys = true }
         call.respondText(
             contentType = ContentType.Application.Json,
-            text = json.encodeToString(OpenID4VPResultData(pages))
+            text = json.encodeToString(buildOpenID4VPResultData(pages))
         )
         break
     } while (true)
@@ -989,7 +991,7 @@ private suspend fun handleDcGetData(
     val json = Json { ignoreUnknownKeys = true }
     call.respondText(
         contentType = ContentType.Application.Json,
-        text = json.encodeToString(OpenID4VPResultData(pages, verificationActivity))
+        text = json.encodeToString(buildOpenID4VPResultData(pages, verificationActivity))
     )
 }
 
@@ -1692,7 +1694,7 @@ private suspend fun handleOpenID4VPGetData(
     val json = Json { ignoreUnknownKeys = true }
     call.respondText(
         contentType = ContentType.Application.Json,
-        text = json.encodeToString(OpenID4VPResultData(pages))
+        text = json.encodeToString(buildOpenID4VPResultData(pages))
     )
 }
 
@@ -1769,6 +1771,25 @@ suspend fun getIssuerTrustManager(): TrustManagerInterface {
         issuerTrustManager = trustManager
         return issuerTrustManager!!
     }
+}
+
+/** Millisecond duration label for ZKP proof validation benchmarks. */
+private fun formatBenchmarkDurationMs(ms: Double): String =
+    if (ms >= 100.0) "${ms.toLong()} ms" else "%.3f ms".format(ms)
+
+private fun isZkpBenchmarkLine(line: ResultLine): Boolean =
+    line.key == "ZKP proof validation time"
+
+private fun buildOpenID4VPResultData(
+    pages: List<ResultPage>,
+    verificationActivity: JsonElement? = null,
+): OpenID4VPResultData {
+    val benchmarks = pages.flatMap { page -> page.lines.filter(::isZkpBenchmarkLine) }
+    return OpenID4VPResultData(pages, verificationActivity, benchmarks)
+}
+
+private fun addZkpBenchmarkLine(lines: MutableList<ResultLine>, value: String) {
+    lines.add(0, ResultLine("ZKP proof validation time", value))
 }
 
 private suspend fun handleGetDataMdoc(
@@ -1898,6 +1919,10 @@ private suspend fun handleGetDataMdoc(
                     it.id == zkDocument.documentData.zkSystemSpecId
                 }
                 if (zkSystemSpec == null) {
+                    addZkpBenchmarkLine(
+                        lines,
+                        "Not measured (ZK system spec not found: ${zkDocument.documentData.zkSystemSpecId})"
+                    )
                     lines.add(
                         ResultLine(
                             "ZK proof",
@@ -1909,14 +1934,51 @@ private suspend fun handleGetDataMdoc(
                         description = "ZK System Spec ID ${zkDocument.documentData.zkSystemSpecId} was not found.",
                     )
                 } else {
-
-                    zkSystemRepository.lookup(zkSystemSpec.system)
-                        ?.verifyProof(
-                            zkDocument,
-                            zkSystemSpec,
-                            Cbor.decode(session.sessionTranscript!!)
+                    val sessionTranscript = Cbor.decode(session.sessionTranscript!!)
+                    val verifyStartedAt = TimeSource.Monotonic.markNow()
+                    try {
+                        zkSystemRepository.lookup(zkSystemSpec.system)
+                            ?.verifyProof(
+                                zkDocument,
+                                zkSystemSpec,
+                                sessionTranscript
+                            )
+                            ?: throw IllegalStateException("Zk System '${zkSystemSpec.system}' was not found.")
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        val verifyTimeLabel = formatBenchmarkDurationMs(
+                            verifyStartedAt.elapsedNow().inWholeMicroseconds / 1000.0
                         )
-                        ?: throw IllegalStateException("Zk System '${zkSystemSpec.system}' was not found.")
+                        Logger.w(
+                            TAG,
+                            "ZKP proof validation failed after $verifyTimeLabel " +
+                                "(system=${zkSystemSpec.system}, specId=${zkSystemSpec.id}): $e"
+                        )
+                        addZkpBenchmarkLine(
+                            lines,
+                            "failed after $verifyTimeLabel " +
+                                "(system=${zkSystemSpec.system}, spec=${zkSystemSpec.id})"
+                        )
+                        lines.add(
+                            ResultLine(
+                                "ZK Verification",
+                                "Failed with error $e"
+                            )
+                        )
+                        continue
+                    }
+                    val verifyTimeLabel = formatBenchmarkDurationMs(
+                        verifyStartedAt.elapsedNow().inWholeMicroseconds / 1000.0
+                    )
+                    Logger.i(
+                        TAG,
+                        "ZKP proof validation: $verifyTimeLabel " +
+                            "(system=${zkSystemSpec.system}, specId=${zkSystemSpec.id})"
+                    )
+                    addZkpBenchmarkLine(
+                        lines,
+                        "$verifyTimeLabel (system=${zkSystemSpec.system}, spec=${zkSystemSpec.id})"
+                    )
                     lines.add(
                         ResultLine(
                             "ZK proof",
@@ -1980,6 +2042,18 @@ private suspend fun handleGetDataMdoc(
                     )
                 )
             }
+        }
+        if (lines.none(::isZkpBenchmarkLine)) {
+            val benchmarkMessage = when {
+                deviceResponse.zkDocuments.isNotEmpty() ->
+                    "Not measured (ZK verification did not complete)"
+                deviceResponse.documents.isNotEmpty() ->
+                    "Not measured (${deviceResponse.documents.size} standard mdoc document(s), " +
+                        "0 ZK documents in response)"
+                else ->
+                    "Not measured (empty DeviceResponse)"
+            }
+            addZkpBenchmarkLine(lines, benchmarkMessage)
         }
         pages.add(ResultPage(lines))
     }
