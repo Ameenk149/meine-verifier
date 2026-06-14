@@ -1,3 +1,124 @@
+# meine-verifier
+
+A fork of [OpenWallet Foundation Multipaz](https://github.com/openwallet-foundation/multipaz)
+focused on the **web-based credential verifier** (`multipaz-verifier-server`).
+
+Multipaz is a set of Kotlin Multiplatform libraries and applications for working with
+real-world identity credentials (ISO/IEC 18013-5 mdoc / mDL, IETF SD-JWT VC) and the
+presentment protocols around them (ISO/IEC 18013-7, W3C Digital Credentials API, and
+OpenID4VP 1.0).
+
+This fork keeps the upstream libraries intact and adds developer-facing tooling on top of the
+over-the-Internet verifier so it's easier to **inspect, debug, and benchmark** credential
+presentment exchanges — and easier to build and run the verifier on a plain server without the
+full Android toolchain.
+
+## What's different from the upstream fork
+
+All changes are additive and scoped to the verifier server and the build setup. They don't alter
+upstream library behavior.
+
+### 1. Build the verifier without an Android SDK
+
+The verifier server is a JVM/Ktor app, but upstream's `settings.gradle.kts` unconditionally
+included the Android-only `:multipaz-dcapi:matcherTest` module, which forces an Android SDK to be
+present even when you only want to build the server.
+
+- `settings.gradle.kts` now detects whether an Android SDK is available (via `ANDROID_HOME` or
+  `local.properties` → `sdk.dir`) and only includes `:multipaz-dcapi:matcherTest` when one exists.
+- `multipaz/build.gradle.kts` and `multipaz-dcapi/build.gradle.kts` reference that test project
+  defensively (`findProject(...)?.let { ... }`) so the build degrades gracefully when it's absent.
+
+The result: you can build and run `multipaz-verifier-server` on a headless Linux server with just
+a JDK, no Android SDK required.
+
+### 2. "Verification activity (debug)" panel
+
+The verifier's web UI (`index.html` + `verifier.js`) now includes a structured, collapsible
+debug panel that traces the last Digital Credentials API exchange end-to-end:
+
+1. **What we asked** — the presentation / DC request that was sent.
+2. **What we received** — the raw wallet response.
+3. **How we verified** — the server-side processing steps.
+4. **What we verified** — the checks that passed.
+5. **Issuer legitimacy** — X.509 chain validation against the built-in `TrustManager`
+   (OWF Multipaz test IACA, Google Wallet IACA, Multipaz test issuer roots).
+6. **Encryption** — the asymmetric/symmetric layers and algorithms used.
+
+On the server side (`verifier.kt`), a trace builder collects these steps into a
+`verificationActivity` JSON object that is returned alongside the credential results, and the
+server logs are enriched to make each stage of validation observable.
+
+### 3. ZKP proof validation benchmarks
+
+The verifier now measures and reports Zero-Knowledge Proof verification timing for ISO 18013-5
+ZK documents (backed by `multipaz-longfellow`):
+
+- `verifier.kt` times each `verifyProof(...)` call with a monotonic clock, logs the duration, and
+  attaches a `"ZKP proof validation time"` result line plus a dedicated `benchmarks` field on the
+  response.
+- Failures and "not measured" cases (no ZK document, ZK system spec not found, verification did
+  not complete) are reported explicitly instead of silently.
+- The web UI highlights the benchmark in a callout at the top of the results modal.
+
+## How to run the verifier server
+
+### Prerequisites
+
+- A JDK (JDK 17+ recommended). No Android SDK is required for the verifier server.
+- The bundled Gradle wrapper (`./gradlew`) handles everything else.
+
+### Run locally
+
+From the repository root:
+
+```shell
+./gradlew multipaz-verifier-server:run
+```
+
+By default the server listens on **port 8006** (see
+`multipaz-verifier-server/src/main/resources/resources/default_configuration.json`). Once it's up,
+open the verifier UI in a browser:
+
+```
+http://localhost:8006/
+```
+
+To point the verifier at a local records / enrollment server, pass arguments through Gradle:
+
+```shell
+./gradlew multipaz-verifier-server:run --args="-param enrollment_server_url=http://localhost:8004"
+```
+
+### Build a distributable artifact
+
+```shell
+./gradlew multipaz-verifier-server:build
+```
+
+### Configuration
+
+Default settings live in
+`multipaz-verifier-server/src/main/resources/resources/default_configuration.json`:
+
+```json
+{
+  "server_port": 8006,
+  "ca_trust_servers": [
+    "*.multipaz.org/**",
+    "sorotokin.com/**"
+  ]
+}
+```
+
+Adjust `server_port` to change the listening port and `ca_trust_servers` to control which CA
+trust endpoints are honored.
+
+---
+
+Everything below documents the upstream Multipaz project and its other modules, libraries, and
+tooling. It is unchanged from upstream.
+
 # Multipaz
 
 This repository contains libraries and applications for working with real-world
